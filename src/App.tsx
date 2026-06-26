@@ -68,6 +68,7 @@ type PlayerSession = {
   subtitles: PlayerSubtitle[];
   unsupportedSubtitleLabels: string[];
   streamFlavor: 'direct' | 'hls';
+  fallbackReason?: 'none' | 'subtitle_unsupported' | 'no_subtitle';
 };
 
 const STORAGE_KEY = 'aurora-emby-web-state';
@@ -241,12 +242,20 @@ function getHlsStreamUrl(profile: ServerProfile, itemId: string, mediaSourceId: 
   url.searchParams.set('DeviceId', DEVICE_ID);
   url.searchParams.set('VideoCodec', 'h264');
   url.searchParams.set('AudioCodec', 'aac');
+  url.searchParams.set('TranscodingMaxAudioChannels', '2');
   url.searchParams.set('MaxWidth', '1920');
   url.searchParams.set('MaxHeight', '1080');
   if (typeof subtitleStreamIndex === 'number') {
     url.searchParams.set('SubtitleStreamIndex', String(subtitleStreamIndex));
   }
   return url.toString();
+}
+
+function getHlsFallbackUrls(profile: ServerProfile, itemId: string, mediaSourceId: string, subtitleStreamIndex?: number) {
+  return [
+    getHlsStreamUrl(profile, itemId, mediaSourceId, subtitleStreamIndex),
+    getStreamUrl(profile, itemId, mediaSourceId),
+  ];
 }
 
 function getImageUrl(profile: ServerProfile, input: { itemId: string; tag?: string; type?: string; width?: number }) {
@@ -583,6 +592,9 @@ function PlayerOverlay({
   onClose: () => void;
 }) {
   const playerRef = useRef<MediaPlayerElement | null>(null);
+  const [currentSrc, setCurrentSrc] = useState('');
+  const [fallbackStep, setFallbackStep] = useState(0);
+  const [playerHint, setPlayerHint] = useState('');
 
   useEffect(() => {
     if (!session || !playerRef.current) return;
@@ -600,11 +612,31 @@ function PlayerOverlay({
     });
   }, [session]);
 
+  useEffect(() => {
+    if (!session) return;
+    const fallbackUrls = getHlsFallbackUrls(profile, session.item.Id, session.mediaSource.Id, session.mediaSource.DefaultSubtitleStreamIndex);
+    setFallbackStep(0);
+    setCurrentSrc(fallbackUrls[0]);
+    setPlayerHint(session.streamFlavor === 'hls' ? '先尝试 HLS 转码流。' : '先尝试当前播放流。');
+  }, [profile, session]);
+
   if (!session) return null;
 
+  const fallbackUrls = getHlsFallbackUrls(profile, session.item.Id, session.mediaSource.Id, session.mediaSource.DefaultSubtitleStreamIndex);
   const subtitleMessage = session.subtitles.length > 0
     ? `已挂载 ${session.subtitles.length} 条文本字幕，播放器右下设置菜单里可直接切换。`
-    : '当前没有可直接挂载的文本字幕。';
+    : '当前没有可直接挂载的文本字幕，但播放器仍会先尝试网页内播放。';
+
+  function handlePlayerError() {
+    if (fallbackStep + 1 < fallbackUrls.length) {
+      const nextStep = fallbackStep + 1;
+      setFallbackStep(nextStep);
+      setCurrentSrc(fallbackUrls[nextStep]);
+      setPlayerHint(nextStep === 1 ? 'HLS 失败，已自动切到直链流再试一次。' : '播放器已切换到备用播放流。');
+      return;
+    }
+    setPlayerHint('网页内播放还是失败了。建议改用下方的 mpv 命令手动播放。');
+  }
 
   return (
     <div className="player-backdrop" onMouseDown={onClose}>
@@ -619,14 +651,15 @@ function PlayerOverlay({
         <div className="player-stage">
           <MediaPlayer
             ref={playerRef}
-            key={session.sourceUrl}
+            key={currentSrc}
             title={session.item.Name}
-            src={session.sourceUrl}
+            src={currentSrc}
             poster={session.posterUrl}
             streamType="on-demand"
             viewType="video"
             crossorigin
             playsInline
+            onError={handlePlayerError}
           >
             <MediaOutlet />
             <MediaCommunitySkin translations={playerTranslations} />
@@ -636,6 +669,7 @@ function PlayerOverlay({
           <div className="panel-card player-note">
             <h3>字幕状态</h3>
             <p className="muted">{subtitleMessage}</p>
+            {playerHint ? <div className="hint-box">{playerHint}</div> : null}
             {session.subtitles.length > 0 && (
               <div className="subtitle-list">
                 {session.subtitles.map((track) => (
@@ -751,28 +785,29 @@ function DetailDrawer({
       const source = playback.MediaSources?.[0] || ({ Id: target.MediaSources?.[0]?.Id || '', ...target.MediaSources?.[0] } as PlaybackMediaSource);
       if (!source?.Id) throw new Error('没有拿到可播放的 MediaSourceId');
       const normalized = normalizeSubtitleTracks(profile, target.Id, source);
-      const shouldUseBrowser = normalized.subtitles.length > 0;
-      setPlaybackMode(shouldUseBrowser ? 'browser' : 'mpv');
-      const browserSourceUrl = shouldUseBrowser
-        ? getHlsStreamUrl(profile, target.Id, source.Id, source.DefaultSubtitleStreamIndex)
-        : '';
+      const hlsUrls = getHlsFallbackUrls(profile, target.Id, source.Id, source.DefaultSubtitleStreamIndex);
+      const fallbackReason = normalized.hasAnySubtitle
+        ? (normalized.subtitles.length > 0 ? 'none' : 'subtitle_unsupported')
+        : 'no_subtitle';
 
-      setPlayerSession(shouldUseBrowser ? {
+      setPlaybackMode('browser');
+      setPlayerSession({
         item: target,
-        sourceUrl: browserSourceUrl,
+        sourceUrl: hlsUrls[0],
         posterUrl: getImageUrl(profile, { itemId: target.Id, tag: target.ImageTags?.Primary, width: 1280 }),
         mediaSource: source,
         subtitles: normalized.subtitles,
         unsupportedSubtitleLabels: normalized.unsupportedLabels,
         streamFlavor: 'hls',
-      } : undefined);
+        fallbackReason,
+      });
 
-      if (shouldUseBrowser) {
-        setPlayStatus('检测到文本字幕，已进入浏览器播放器并接入字幕菜单。');
+      if (normalized.subtitles.length > 0) {
+        setPlayStatus('检测到文本字幕，优先进入浏览器播放器并接入字幕菜单。');
       } else if (normalized.hasAnySubtitle) {
-        setPlayStatus('当前字幕不是浏览器可用文本轨，已回退到 mpv 方案。请先填写 mpv.exe 路径，再复制命令播放。');
+        setPlayStatus('当前字幕不是浏览器可用文本轨，但仍会先尝试网页内播放；如果不稳，你再手动选 mpv。');
       } else {
-        setPlayStatus('当前片源没有字幕，已回退到 mpv 方案。请先填写 mpv.exe 路径，再复制命令播放。');
+        setPlayStatus('当前片源没有字幕，先直接尝试网页内播放；如果不稳，你再自己选 mpv。');
       }
     } catch (err) {
       setPlayStatus(getErrorMessage(err));
@@ -1009,7 +1044,7 @@ function Home({ activeView, state, profile }: { activeView?: string; state: AppS
           </button>
         </div>
       </section>
-      <div className="success-box"><Check size={18} /><span>现在改成智能方案：检测到文本字幕就走浏览器播放器；没有字幕或字幕不适合浏览器时，自动建议回退到 mpv。</span></div>
+      <div className="success-box"><Check size={18} /><span>现在改成更宽松的策略：无论是否有字幕都先尝试网页内播放；若 HLS 不行会自动再试直链，实在不稳你再自己选 mpv。</span></div>
       {status === 'loading' && <div className={`grid ${density === 'compact' ? 'grid-compact' : ''} skeleton-grid`}>{Array.from({ length: 12 }).map((_, index) => <div className="skeleton-card" key={index} />)}</div>}
       {status === 'error' && <div className="error-state"><h3>加载失败</h3><p>{error}</p></div>}
       {status === 'ready' && visibleItems.length === 0 && <div className="empty-state"><Tv size={42} /><h3>没有找到媒体</h3><p>换个入口或关键词试试，比如继续观看、最新入库、下一集。</p></div>}
@@ -1067,7 +1102,7 @@ function SettingsPage({ profile, mpvPath, onReconnect, onSaveMpvPath }: { profil
 
         <section className="panel-card">
           <h2>mpv 回退设置</h2>
-          <p className="muted">如果没有字幕，或者字幕不适合浏览器前端展示，就回退到 mpv 播放。这里先保存一次本机 `mpv.exe` 路径。</p>
+          <p className="muted">网页内播放会优先尝试，但你依然可以提前把 `mpv.exe` 路径存好。真遇到播放不稳、复杂字幕或解码异常时，随时切回 mpv。</p>
           <label><span>mpv.exe 路径</span><input value={draftMpvPath} onChange={(event) => setDraftMpvPath(event.target.value)} placeholder="C:\\Tools\\mpv\\mpv.exe" /></label>
           <div className="action-row compact-actions">
             <button className="secondary-button" onClick={saveMpvPath}><MonitorPlay size={16} />保存 mpv 路径</button>
@@ -1075,8 +1110,8 @@ function SettingsPage({ profile, mpvPath, onReconnect, onSaveMpvPath }: { profil
           </div>
           <ul className="tutorial-list compact">
             <li>有文本字幕：优先用浏览器内播放器。</li>
-            <li>无字幕：直接回退 mpv，复制命令到 PowerShell 播放。</li>
-            <li>PGS / 图形字幕 / 复杂内封字幕：也优先回退 mpv。</li>
+            <li>无字幕：也先尝试网页内播放，不强制立刻回退。</li>
+            <li>PGS / 图形字幕 / 复杂内封字幕：网页内不稳时再自行切回 mpv。</li>
           </ul>
         </section>
       </section>
@@ -1088,7 +1123,7 @@ function SettingsPage({ profile, mpvPath, onReconnect, onSaveMpvPath }: { profil
             <li>页面会自动连默认线路，不再显示登录表单。</li>
             <li>进入影片详情后点“检测后播放”。</li>
             <li>如果检测到文本字幕，就进入浏览器播放器，并可在右下角设置里切字幕。</li>
-            <li>如果没有字幕，或者字幕不适合浏览器，就回退到 mpv；此时用“复制 mpv 命令”即可。</li>
+            <li>如果网页内播放不稳、加载失败，或者你想自己控制外部播放器，再手动用“复制 mpv 命令”。</li>
           </ol>
         </section>
 
