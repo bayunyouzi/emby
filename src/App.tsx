@@ -42,6 +42,7 @@ import type {
 } from './lib/types';
 import { bitrateToText, bytesToSize, getErrorMessage, ticksToTime } from './lib/format';
 
+type PlaybackMode = 'browser' | 'mpv';
 type Screen = 'home' | 'settings';
 type LoadState = 'idle' | 'loading' | 'error' | 'ready';
 type SortOrder = 'Ascending' | 'Descending';
@@ -66,9 +67,11 @@ type PlayerSession = {
   mediaSource: PlaybackMediaSource;
   subtitles: PlayerSubtitle[];
   unsupportedSubtitleLabels: string[];
+  streamFlavor: 'direct' | 'hls';
 };
 
 const STORAGE_KEY = 'aurora-emby-web-state';
+const DEVICE_ID = 'aurora-emby-web';
 const defaultLogin: LoginInput = {
   url: 'https://zhuixin.8622368.xyz:443',
   username: 'sx_40f9adf6e0e84d9c83c98f15889d8127',
@@ -79,6 +82,7 @@ const initialState: AppState = {
   profiles: [],
   activeProfileId: undefined,
   theme: 'system',
+  mpvPath: '',
 };
 const playerTranslations = {
   Play: '播放',
@@ -143,6 +147,7 @@ function readStoredState(): AppState {
       profiles: Array.isArray(parsed.profiles) ? parsed.profiles : [],
       activeProfileId: parsed.activeProfileId,
       theme: parsed.theme || 'system',
+      mpvPath: parsed.mpvPath || '',
     };
   } catch {
     return initialState;
@@ -229,6 +234,21 @@ function getStreamUrl(profile: ServerProfile, itemId: string, mediaSourceId?: st
   return url.toString();
 }
 
+function getHlsStreamUrl(profile: ServerProfile, itemId: string, mediaSourceId: string, subtitleStreamIndex?: number) {
+  const url = new URL(`${profile.url}/Videos/${itemId}/master.m3u8`);
+  url.searchParams.set('api_key', profile.accessToken);
+  url.searchParams.set('MediaSourceId', mediaSourceId);
+  url.searchParams.set('DeviceId', DEVICE_ID);
+  url.searchParams.set('VideoCodec', 'h264');
+  url.searchParams.set('AudioCodec', 'aac');
+  url.searchParams.set('MaxWidth', '1920');
+  url.searchParams.set('MaxHeight', '1080');
+  if (typeof subtitleStreamIndex === 'number') {
+    url.searchParams.set('SubtitleStreamIndex', String(subtitleStreamIndex));
+  }
+  return url.toString();
+}
+
 function getImageUrl(profile: ServerProfile, input: { itemId: string; tag?: string; type?: string; width?: number }) {
   const type = input.type || 'Primary';
   const url = new URL(`${profile.url}/Items/${input.itemId}/Images/${type}`);
@@ -243,6 +263,19 @@ function getSubtitleUrl(profile: ServerProfile, itemId: string, mediaSourceId: s
   const url = new URL(`${profile.url}/Videos/${itemId}/${mediaSourceId}/Subtitles/${index}/Stream.${format}`);
   url.searchParams.set('api_key', profile.accessToken);
   return url.toString();
+}
+
+function escapePowerShell(text: string) {
+  return text.replace(/`/g, '``').replace(/"/g, '`"');
+}
+
+function buildMpvCommand(profile: ServerProfile, item: EmbyItem, mpvPath: string) {
+  const streamUrl = getStreamUrl(profile, item.Id, item.MediaSources?.[0]?.Id);
+  const title = escapePowerShell(item.Name || 'Aurora Emby Web');
+  const header = escapePowerShell(`X-Emby-Token: ${profile.accessToken}`);
+  const executable = escapePowerShell(mpvPath.trim());
+  const url = escapePowerShell(streamUrl);
+  return `& "${executable}" --force-window=yes --profile=high-quality --hwdec=auto-safe --gpu-api=auto --vo=gpu-next --video-sync=display-resample --interpolation=yes --cache=yes --demuxer-max-bytes=512MiB --demuxer-max-back-bytes=256MiB --cache-secs=60 --network-timeout=15 --force-seekable=yes --save-position-on-quit=yes --title="${title}" --http-header-fields="${header}" "${url}"`;
 }
 
 function buildItemQuery(input: { parentId?: string; searchTerm?: string; startIndex?: number; limit?: number; sortBy?: string; sortOrder?: SortOrder; includeItemTypes?: string; isPlayed?: boolean }) {
@@ -447,6 +480,7 @@ function normalizeSubtitleTracks(profile: ServerProfile, itemId: string, mediaSo
   return {
     subtitles,
     unsupportedLabels: unsupported.map((stream) => formatSubtitleLabel(stream)),
+    hasAnySubtitle: allStreams.some((stream) => stream.Type === 'Subtitle'),
   };
 }
 
@@ -640,11 +674,13 @@ function PlayerOverlay({
 function DetailDrawer({
   profile,
   item,
+  mpvPath,
   onClose,
   onChanged,
 }: {
   profile: ServerProfile;
   item?: EmbyItem;
+  mpvPath: string;
   onClose: () => void;
   onChanged: () => void;
 }) {
@@ -656,6 +692,7 @@ function DetailDrawer({
   const [episodeOrder, setEpisodeOrder] = useState<SortOrder>('Ascending');
   const [playerSession, setPlayerSession] = useState<PlayerSession | undefined>();
   const [playerLoading, setPlayerLoading] = useState(false);
+  const [playbackMode, setPlaybackMode] = useState<PlaybackMode>('browser');
   const sortedEpisodes = useMemo(() => [...episodes].sort((a, b) => compareEpisodes(a, b, episodeOrder)), [episodes, episodeOrder]);
 
   useEffect(() => {
@@ -714,19 +751,48 @@ function DetailDrawer({
       const source = playback.MediaSources?.[0] || ({ Id: target.MediaSources?.[0]?.Id || '', ...target.MediaSources?.[0] } as PlaybackMediaSource);
       if (!source?.Id) throw new Error('没有拿到可播放的 MediaSourceId');
       const normalized = normalizeSubtitleTracks(profile, target.Id, source);
-      setPlayerSession({
+      const shouldUseBrowser = normalized.subtitles.length > 0;
+      setPlaybackMode(shouldUseBrowser ? 'browser' : 'mpv');
+      const browserSourceUrl = shouldUseBrowser
+        ? getHlsStreamUrl(profile, target.Id, source.Id, source.DefaultSubtitleStreamIndex)
+        : '';
+
+      setPlayerSession(shouldUseBrowser ? {
         item: target,
-        sourceUrl: getStreamUrl(profile, target.Id, source.Id),
+        sourceUrl: browserSourceUrl,
         posterUrl: getImageUrl(profile, { itemId: target.Id, tag: target.ImageTags?.Primary, width: 1280 }),
         mediaSource: source,
         subtitles: normalized.subtitles,
         unsupportedSubtitleLabels: normalized.unsupportedLabels,
-      });
-      setPlayStatus(normalized.subtitles.length > 0 ? '播放器已准备好，字幕菜单也一起接进去了。' : '播放器已准备好，但当前片源没有可直接挂载的文本字幕。');
+        streamFlavor: 'hls',
+      } : undefined);
+
+      if (shouldUseBrowser) {
+        setPlayStatus('检测到文本字幕，已进入浏览器播放器并接入字幕菜单。');
+      } else if (normalized.hasAnySubtitle) {
+        setPlayStatus('当前字幕不是浏览器可用文本轨，已回退到 mpv 方案。请先填写 mpv.exe 路径，再复制命令播放。');
+      } else {
+        setPlayStatus('当前片源没有字幕，已回退到 mpv 方案。请先填写 mpv.exe 路径，再复制命令播放。');
+      }
     } catch (err) {
       setPlayStatus(getErrorMessage(err));
     } finally {
       setPlayerLoading(false);
+    }
+  }
+
+  async function copyMpvCommand(target: EmbyItem) {
+    const path = mpvPath.trim();
+    if (!path) {
+      setPlayStatus('还没有填写 mpv.exe 路径。先到设置页保存路径，再回来复制命令。');
+      return;
+    }
+    try {
+      const command = buildMpvCommand(profile, target, path);
+      await navigator.clipboard.writeText(command);
+      setPlayStatus('已复制 PowerShell 播放命令。把命令粘贴到本机 PowerShell 回车即可用 mpv 播放。');
+    } catch (err) {
+      setPlayStatus(getErrorMessage(err));
     }
   }
 
@@ -785,8 +851,9 @@ function DetailDrawer({
                 <div className="action-grid">
                   <button className="primary-button wide" onClick={() => openPlayer(detail)} disabled={playerLoading}>
                     {playerLoading ? <Loader2 className="spin" size={18} /> : <Play size={18} />}
-                    进入页面内播放器
+                    检测后播放
                   </button>
+                  <button className="secondary-button" onClick={() => copyMpvCommand(detail)}><MonitorPlay size={18} />复制 mpv 命令</button>
                   <button className="secondary-button" onClick={() => copyLink(detail)}><Copy size={18} />复制直链</button>
                   <button className="secondary-button" onClick={() => openStream(detail)}><SquareArrowOutUpRight size={18} />浏览器打开</button>
                 </div>
@@ -823,6 +890,7 @@ function DetailDrawer({
                     <Play size={16} />
                   </button>
                   <div className="episode-actions">
+                    <button className="mini-button" onClick={() => copyMpvCommand(episode)}><MonitorPlay size={14} />mpv</button>
                     <button className="mini-button" onClick={() => copyLink(episode)}><Copy size={14} />直链</button>
                     <button className="mini-button" onClick={() => openStream(episode)}><SquareArrowOutUpRight size={14} />打开</button>
                   </div>
@@ -833,7 +901,7 @@ function DetailDrawer({
           )}
         </aside>
       </div>
-      <PlayerOverlay profile={profile} session={playerSession} onClose={() => setPlayerSession(undefined)} />
+      {playbackMode === 'browser' ? <PlayerOverlay profile={profile} session={playerSession} onClose={() => setPlayerSession(undefined)} /> : null}
     </>
   );
 }
@@ -913,7 +981,7 @@ function Home({ activeView, state, profile }: { activeView?: string; state: AppS
       <section className="status-strip">
         <div><strong>{visibleItems.length}/{total}</strong><span>当前显示 / 总媒体</span></div>
         <div><strong>{mode === 'library' ? activeSort.label : homeModes.find((item) => item.value === mode)?.label}</strong><span>{mode === 'library' ? (sortOrder === 'Descending' ? '倒序' : '正序') : '官方接口'}</span></div>
-        <div><strong>直连播放</strong><span>Vidstack 页面内播放器 + 字幕菜单</span></div>
+        <div><strong>智能回退</strong><span>有文本字幕走浏览器，无字幕或复杂字幕回退 mpv</span></div>
       </section>
       <section className="toolbar-panel">
         <div className="control-group">
@@ -941,7 +1009,7 @@ function Home({ activeView, state, profile }: { activeView?: string; state: AppS
           </button>
         </div>
       </section>
-      <div className="success-box"><Check size={18} /><span>播放器已改为页面内直连播放。点开详情后直接进 Vidstack，字幕切换在播放器设置菜单里。</span></div>
+      <div className="success-box"><Check size={18} /><span>现在改成智能方案：检测到文本字幕就走浏览器播放器；没有字幕或字幕不适合浏览器时，自动建议回退到 mpv。</span></div>
       {status === 'loading' && <div className={`grid ${density === 'compact' ? 'grid-compact' : ''} skeleton-grid`}>{Array.from({ length: 12 }).map((_, index) => <div className="skeleton-card" key={index} />)}</div>}
       {status === 'error' && <div className="error-state"><h3>加载失败</h3><p>{error}</p></div>}
       {status === 'ready' && visibleItems.length === 0 && <div className="empty-state"><Tv size={42} /><h3>没有找到媒体</h3><p>换个入口或关键词试试，比如继续观看、最新入库、下一集。</p></div>}
@@ -958,22 +1026,32 @@ function Home({ activeView, state, profile }: { activeView?: string; state: AppS
           {visibleItems.length < total && mode !== 'nextup' && <button className="load-more" onClick={() => setLimit((value) => value + 100)}><RefreshCw size={18} />加载更多</button>}
         </div>
       )}
-      <DetailDrawer profile={profile} item={selected} onClose={() => setSelected(undefined)} onChanged={() => setRefreshSeed((value) => value + 1)} />
+      <DetailDrawer profile={profile} item={selected} mpvPath={state.mpvPath || ''} onClose={() => setSelected(undefined)} onChanged={() => setRefreshSeed((value) => value + 1)} />
     </main>
   );
 }
 
-function SettingsPage({ profile, onReconnect }: { profile?: ServerProfile; onReconnect: () => void }) {
+function SettingsPage({ profile, mpvPath, onReconnect, onSaveMpvPath }: { profile?: ServerProfile; mpvPath: string; onReconnect: () => void; onSaveMpvPath: (path: string) => void }) {
   const [message, setMessage] = useState('');
+  const [draftMpvPath, setDraftMpvPath] = useState(mpvPath);
+
+  useEffect(() => {
+    setDraftMpvPath(mpvPath);
+  }, [mpvPath]);
 
   function clearLocalSession() {
     window.localStorage.removeItem(STORAGE_KEY);
     setMessage('本地缓存已清空。重新连接后会自动写回新的登录态。');
   }
 
+  function saveMpvPath() {
+    onSaveMpvPath(draftMpvPath.trim());
+    setMessage(draftMpvPath.trim() ? 'mpv 路径已保存。无字幕时可直接复制命令播放。' : '已清空 mpv 路径。');
+  }
+
   return (
     <main className="content settings-content">
-      <header className="topbar"><div><p className="eyebrow">播放器设置</p><h1>默认线路与字幕策略</h1></div></header>
+      <header className="topbar"><div><p className="eyebrow">播放器设置</p><h1>默认线路、字幕与 mpv 回退</h1></div></header>
       <section className="settings-grid">
         <section className="panel-card">
           <h2>默认线路</h2>
@@ -983,16 +1061,22 @@ function SettingsPage({ profile, onReconnect }: { profile?: ServerProfile; onRec
               <strong>{profile?.name || '默认 Emby 线路'}</strong>
               <span>{profile ? `最近登录：${new Date(profile.lastLoginAt).toLocaleString()}` : '尚未建立连接'}</span>
             </div>
-            <button className="secondary-button" onClick={onReconnect}><Wifi size={16} />重新连接</button>
+            <button className="secondary-button" type="button" onClick={onReconnect}><Wifi size={16} />重新连接</button>
           </div>
         </section>
 
         <section className="panel-card">
-          <h2>字幕说明</h2>
+          <h2>mpv 回退设置</h2>
+          <p className="muted">如果没有字幕，或者字幕不适合浏览器前端展示，就回退到 mpv 播放。这里先保存一次本机 `mpv.exe` 路径。</p>
+          <label><span>mpv.exe 路径</span><input value={draftMpvPath} onChange={(event) => setDraftMpvPath(event.target.value)} placeholder="C:\\Tools\\mpv\\mpv.exe" /></label>
+          <div className="action-row compact-actions">
+            <button className="secondary-button" onClick={saveMpvPath}><MonitorPlay size={16} />保存 mpv 路径</button>
+            <a className="download-link" href="/downloads/mpv-x86_64-20260610-git-304426c.7z" download>下载 mpv 压缩包</a>
+          </div>
           <ul className="tutorial-list compact">
-            <li>播放器已经接入字幕菜单，文本字幕会自动转换成 VTT 轨道加载。</li>
-            <li>如果 Emby 返回的是 PGS、图形字幕或某些复杂内封 ASS，浏览器通常无法直接作为文本轨展示。</li>
-            <li>这类字幕需要服务端转码、转字幕格式，或者直接烧录到视频流里。</li>
+            <li>有文本字幕：优先用浏览器内播放器。</li>
+            <li>无字幕：直接回退 mpv，复制命令到 PowerShell 播放。</li>
+            <li>PGS / 图形字幕 / 复杂内封字幕：也优先回退 mpv。</li>
           </ul>
         </section>
       </section>
@@ -1002,9 +1086,9 @@ function SettingsPage({ profile, onReconnect }: { profile?: ServerProfile; onRec
           <h2>当前版本怎么用</h2>
           <ol className="tutorial-list">
             <li>页面会自动连默认线路，不再显示登录表单。</li>
-            <li>进入影片详情后点“进入页面内播放器”。</li>
-            <li>播放界面右下角打开“设置”，可切换字幕、倍速、清晰度。</li>
-            <li>若字幕菜单为空，优先检查片源是否存在文本字幕轨。</li>
+            <li>进入影片详情后点“检测后播放”。</li>
+            <li>如果检测到文本字幕，就进入浏览器播放器，并可在右下角设置里切字幕。</li>
+            <li>如果没有字幕，或者字幕不适合浏览器，就回退到 mpv；此时用“复制 mpv 命令”即可。</li>
           </ol>
         </section>
 
@@ -1100,7 +1184,7 @@ export function App() {
       <div className="mobile-warning">{viewError && <div className="warning-box inline-warning"><AlertTriangle size={16} /><span>{viewError}</span></div>}</div>
       {screen === 'home'
         ? <Home activeView={activeView} state={state} profile={activeProfile} />
-        : <SettingsPage profile={activeProfile} onReconnect={() => void connectDefaultProfile()} />}
+        : <SettingsPage profile={activeProfile} mpvPath={state.mpvPath || ''} onReconnect={() => void connectDefaultProfile()} onSaveMpvPath={(path) => patchState({ mpvPath: path })} />}
     </div>
   );
 }

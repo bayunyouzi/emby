@@ -21,6 +21,7 @@ export interface AppState {
   profiles: ServerProfile[];
   activeProfileId?: string;
   theme: ThemeMode;
+  mpvPath?: string;
 }
 
 export interface EmbyImageTags {
