@@ -76,10 +76,11 @@ type PlayerSession = {
   streamFlavor: 'direct' | 'hls';
   fallbackReason?: 'none' | 'subtitle_unsupported' | 'no_subtitle';
   sourceChain: PlayerSource[];
+  aspectRatio: number;
 };
 
-const STORAGE_KEY = 'aurora-emby-web-state';
-const DEVICE_ID = 'aurora-emby-web';
+const STORAGE_KEY = 'youzi-video-state';
+const DEVICE_ID = 'youzi-video-web';
 const defaultLogin: LoginInput = {
   url: 'https://zhuixin.8622368.xyz:443',
   username: 'sx_40f9adf6e0e84d9c83c98f15889d8127',
@@ -194,7 +195,7 @@ async function loginToEmby(input: LoginInput) {
     headers: {
       'Content-Type': 'application/json',
       Accept: 'application/json',
-      'X-Emby-Authorization': 'MediaBrowser Client="Aurora Emby Web", Device="Browser", DeviceId="aurora-emby-web", Version="1.1.0"',
+      'X-Emby-Authorization': 'MediaBrowser Client="柚子视频", Device="Browser", DeviceId="youzi-video-web", Version="1.1.0"',
     },
     body: JSON.stringify({ Username: username, Pw: password }),
   });
@@ -295,7 +296,7 @@ function escapePowerShell(text: string) {
 
 function buildMpvCommand(profile: ServerProfile, item: EmbyItem, mpvPath: string) {
   const streamUrl = getStreamUrl(profile, item.Id, item.MediaSources?.[0]?.Id);
-  const title = escapePowerShell(item.Name || 'Aurora Emby Web');
+  const title = escapePowerShell(item.Name || '柚子视频');
   const header = escapePowerShell(`X-Emby-Token: ${profile.accessToken}`);
   const executable = escapePowerShell(mpvPath.trim());
   const url = escapePowerShell(streamUrl);
@@ -488,6 +489,22 @@ function formatSubtitleLabel(stream: EmbyMediaStream) {
   return flags.length ? `${base} · ${flags.join(' · ')}` : base;
 }
 
+function getPlayerAspectRatio(mediaSource: PlaybackMediaSource) {
+  const videoStream = (mediaSource.MediaStreams || []).find((stream) => stream.Type === 'Video');
+  if (videoStream?.Width && videoStream?.Height && videoStream.Height > 0) {
+    return videoStream.Width / videoStream.Height;
+  }
+  if (videoStream?.DisplayAspectRatio) {
+    const match = videoStream.DisplayAspectRatio.match(/(\d+(?:\.\d+)?):(\d+(?:\.\d+)?)/);
+    if (match) {
+      const w = Number(match[1]);
+      const h = Number(match[2]);
+      if (w > 0 && h > 0) return w / h;
+    }
+  }
+  return 16 / 9;
+}
+
 function normalizeSubtitleTracks(profile: ServerProfile, itemId: string, mediaSource: PlaybackMediaSource) {
   const allStreams = mediaSource.MediaStreams || [];
   const textTracks = allStreams.filter((stream) => stream.Type === 'Subtitle' && stream.IsTextSubtitleStream);
@@ -515,7 +532,7 @@ function AutoConnectGate({ status, error, onRetry }: { status: LoadState; error:
         <div className="orb orb-a" />
         <div className="orb orb-b" />
         <div className="brand-mark"><MonitorPlay size={34} /></div>
-        <p className="eyebrow">Aurora Emby Web</p>
+        <p className="eyebrow">柚子视频</p>
         <h1>正在连接默认媒体线路。</h1>
         <p className="hero-copy">默认服务器配置已内置，前端不再显示可编辑入口。连上后直接进媒体库和页面内播放器。</p>
         <div className="hero-metrics">
@@ -555,7 +572,7 @@ function Sidebar({
     <aside className="sidebar">
       <div className="side-brand">
         <div className="brand-mark small"><MonitorPlay size={22} /></div>
-        <div><strong>Aurora</strong><span>Emby Web</span></div>
+        <div><strong>柚子</strong><span>视频</span></div>
       </div>
       <button className={`nav-item ${screen === 'home' && !activeView ? 'active' : ''}`} onClick={() => { onScreen('home'); onSelectView(undefined); }}><Sparkles size={18} />全部媒体</button>
       {views.map((view) => (
@@ -663,7 +680,7 @@ function PlayerOverlay({
           </div>
           <button className="icon-button close" onClick={onClose}><X size={20} /></button>
         </div>
-        <div className="player-stage">
+        <div className="player-stage" style={{ aspectRatio: String(session.aspectRatio) }}>
           <MediaPlayer
             ref={playerRef}
             key={currentSrc}
@@ -712,6 +729,7 @@ function PlayerOverlay({
               <li>播放器右下角“设置”里可以切换字幕、清晰度、倍速。</li>
               <li>如果字幕菜单为空，说明当前片源没有可直接转换成浏览器文本轨的字幕。</li>
               <li>如果视频黑屏或无法播放，通常是该媒体编码浏览器不认，或者服务器需要更强的转码支持。</li>
+              <li>当前播放器已按视频真实宽高比渲染，不再强制锁死 16:9 容器。</li>
             </ul>
             <div className="action-row compact-actions">
               <a className="secondary-button" href={session.sourceUrl} target="_blank" rel="noreferrer"><SquareArrowOutUpRight size={16} />新标签页打开流</a>
@@ -820,6 +838,7 @@ function DetailDrawer({
         streamFlavor: 'direct',
         fallbackReason,
         sourceChain,
+        aspectRatio: getPlayerAspectRatio(source),
       });
 
       if (normalized.subtitles.length > 0) {

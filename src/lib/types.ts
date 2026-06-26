@@ -62,6 +62,9 @@ export interface EmbyMediaStream {
   IsForced?: boolean;
   DeliveryMethod?: string;
   DeliveryUrl?: string;
+  Width?: number;
+  Height?: number;
+  DisplayAspectRatio?: string;
 }
 
 export interface PlaybackMediaSource extends MediaSource {
