@@ -1,13 +1,10 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertTriangle,
   ArrowDownAZ,
   ArrowUpAZ,
-  CalendarClock,
   Check,
   Copy,
-  Download,
-  ExternalLink,
   Film,
   Grid2X2,
   Grid3X3,
@@ -17,17 +14,32 @@ import {
   Play,
   RefreshCw,
   Search,
-  Server,
   Settings,
   Sparkles,
   SquareArrowOutUpRight,
   Star,
-  Trash2,
   Tv,
   Wifi,
   X,
 } from 'lucide-react';
-import type { AppState, EmbyItem, EmbyItemsResponse, LoginInput, ServerProfile, ThemeMode, ViewResponse } from './lib/types';
+import {
+  MediaCommunitySkin,
+  MediaOutlet,
+  MediaPlayer,
+} from '@vidstack/react';
+import { TextTrack, type MediaPlayerElement } from 'vidstack';
+import type {
+  AppState,
+  EmbyItem,
+  EmbyItemsResponse,
+  EmbyMediaStream,
+  LoginInput,
+  PlaybackInfoResponse,
+  PlaybackMediaSource,
+  ServerProfile,
+  ThemeMode,
+  ViewResponse,
+} from './lib/types';
 import { bitrateToText, bytesToSize, getErrorMessage, ticksToTime } from './lib/format';
 
 type Screen = 'home' | 'settings';
@@ -38,6 +50,23 @@ type FilterOption = 'all' | 'Series' | 'Movie' | 'Video' | 'unplayed' | 'favorit
 type DensityOption = 'comfortable' | 'compact';
 type HomeMode = 'library' | 'latest' | 'resume' | 'nextup';
 type ResultGroup = { key: string; title: string; description: string; items: EmbyItem[] };
+type PlayerSubtitle = {
+  id: string;
+  label: string;
+  language: string;
+  src: string;
+  isDefault: boolean;
+  codec?: string;
+  isForced?: boolean;
+};
+type PlayerSession = {
+  item: EmbyItem;
+  sourceUrl: string;
+  posterUrl: string;
+  mediaSource: PlaybackMediaSource;
+  subtitles: PlayerSubtitle[];
+  unsupportedSubtitleLabels: string[];
+};
 
 const STORAGE_KEY = 'aurora-emby-web-state';
 const defaultLogin: LoginInput = {
@@ -50,7 +79,29 @@ const initialState: AppState = {
   profiles: [],
   activeProfileId: undefined,
   theme: 'system',
-  mpvPath: '',
+};
+const playerTranslations = {
+  Play: '播放',
+  Pause: '暂停',
+  Mute: '静音',
+  Unmute: '取消静音',
+  Audio: '音轨',
+  Speed: '速度',
+  Normal: '正常',
+  Quality: '清晰度',
+  Auto: '自动',
+  Settings: '设置',
+  Captions: '字幕',
+  Off: '关闭',
+  Chapters: '章节',
+  'Seek Forward': '快进',
+  'Seek Backward': '快退',
+  'Closed-Captions On': '字幕开',
+  'Closed-Captions Off': '字幕关',
+  'Enter Fullscreen': '进入全屏',
+  'Exit Fullscreen': '退出全屏',
+  'Enter PiP': '画中画',
+  'Exit PiP': '退出画中画',
 };
 
 const sortOptions: { value: SortOption; label: string; emby: string }[] = [
@@ -92,7 +143,6 @@ function readStoredState(): AppState {
       profiles: Array.isArray(parsed.profiles) ? parsed.profiles : [],
       activeProfileId: parsed.activeProfileId,
       theme: parsed.theme || 'system',
-      mpvPath: parsed.mpvPath || '',
     };
   } catch {
     return initialState;
@@ -131,7 +181,7 @@ async function loginToEmby(input: LoginInput) {
     headers: {
       'Content-Type': 'application/json',
       Accept: 'application/json',
-      'X-Emby-Authorization': 'MediaBrowser Client="Aurora Emby Web", Device="Browser", DeviceId="aurora-emby-web", Version="1.0.0"',
+      'X-Emby-Authorization': 'MediaBrowser Client="Aurora Emby Web", Device="Browser", DeviceId="aurora-emby-web", Version="1.1.0"',
     },
     body: JSON.stringify({ Username: username, Pw: password }),
   });
@@ -144,7 +194,7 @@ async function loginToEmby(input: LoginInput) {
   const data = await response.json() as { AccessToken?: string; User?: { Id?: string; Name?: string } };
   if (!data.AccessToken || !data.User?.Id) throw new Error('登录响应缺少 AccessToken 或 UserId');
 
-  const profile: ServerProfile = {
+  return {
     id: `${serverUrl}|${data.User.Id}`,
     name: input.name.trim() || data.User.Name || username,
     url: serverUrl,
@@ -152,9 +202,7 @@ async function loginToEmby(input: LoginInput) {
     accessToken: data.AccessToken,
     userId: data.User.Id,
     lastLoginAt: new Date().toISOString(),
-  };
-
-  return profile;
+  } satisfies ServerProfile;
 }
 
 async function embyRequest<T>(profile: ServerProfile, path: string, init: RequestInit = {}) {
@@ -188,6 +236,12 @@ function getImageUrl(profile: ServerProfile, input: { itemId: string; tag?: stri
   url.searchParams.set('quality', '90');
   if (input.width) url.searchParams.set('maxWidth', String(input.width));
   if (input.tag) url.searchParams.set('tag', input.tag);
+  return url.toString();
+}
+
+function getSubtitleUrl(profile: ServerProfile, itemId: string, mediaSourceId: string, index: number, format: 'vtt' | 'srt' = 'vtt') {
+  const url = new URL(`${profile.url}/Videos/${itemId}/${mediaSourceId}/Subtitles/${index}/Stream.${format}`);
+  url.searchParams.set('api_key', profile.accessToken);
   return url.toString();
 }
 
@@ -265,6 +319,20 @@ function fetchEpisodes(profile: ServerProfile, seriesId: string, sortOrder: Sort
     SortOrder: sortOrder,
   });
   return embyRequest<EmbyItemsResponse>(profile, `/Shows/${seriesId}/Episodes?${params.toString()}`);
+}
+
+function fetchPlaybackInfo(profile: ServerProfile, itemId: string, mediaSourceId?: string) {
+  return embyRequest<PlaybackInfoResponse>(profile, `/Items/${itemId}/PlaybackInfo`, {
+    method: 'POST',
+    body: JSON.stringify({
+      UserId: profile.userId,
+      MediaSourceId: mediaSourceId,
+      EnableDirectPlay: true,
+      EnableDirectStream: true,
+      EnableTranscoding: true,
+      StartTimeTicks: 0,
+    }),
+  });
 }
 
 function setFavorite(profile: ServerProfile, itemId: string, favorite: boolean) {
@@ -357,91 +425,74 @@ function buildResultGroups(items: EmbyItem[], search: string, mode: HomeMode): R
   return groups;
 }
 
-function escapePowerShell(text: string) {
-  return text.replace(/`/g, '``').replace(/"/g, '`"');
+function formatSubtitleLabel(stream: EmbyMediaStream) {
+  const base = stream.DisplayTitle || stream.Title || stream.Language || '未命名字幕';
+  const flags = [stream.IsForced ? '强制' : '', stream.Codec ? stream.Codec.toUpperCase() : ''].filter(Boolean);
+  return flags.length ? `${base} · ${flags.join(' · ')}` : base;
 }
 
-function buildMpvCommand(profile: ServerProfile, item: EmbyItem, mpvPath: string) {
-  const streamUrl = getStreamUrl(profile, item.Id, item.MediaSources?.[0]?.Id);
-  const title = escapePowerShell(item.Name || 'Aurora Emby Web');
-  const header = escapePowerShell(`X-Emby-Token: ${profile.accessToken}`);
-  const executable = escapePowerShell(mpvPath.trim());
-  const url = escapePowerShell(streamUrl);
-  return `& "${executable}" --force-window=yes --profile=high-quality --hwdec=auto-safe --gpu-api=auto --vo=gpu-next --video-sync=display-resample --interpolation=yes --cache=yes --demuxer-max-bytes=512MiB --demuxer-max-back-bytes=256MiB --cache-secs=60 --network-timeout=15 --force-seekable=yes --save-position-on-quit=yes --title="${title}" --http-header-fields="${header}" "${url}"`;
+function normalizeSubtitleTracks(profile: ServerProfile, itemId: string, mediaSource: PlaybackMediaSource) {
+  const allStreams = mediaSource.MediaStreams || [];
+  const textTracks = allStreams.filter((stream) => stream.Type === 'Subtitle' && stream.IsTextSubtitleStream);
+  const unsupported = allStreams.filter((stream) => stream.Type === 'Subtitle' && !stream.IsTextSubtitleStream);
+  const subtitles = textTracks.map((stream) => ({
+    id: `${mediaSource.Id}-${stream.Index}`,
+    label: formatSubtitleLabel(stream),
+    language: stream.Language || 'und',
+    src: getSubtitleUrl(profile, itemId, mediaSource.Id, stream.Index, 'vtt'),
+    isDefault: stream.IsDefault || mediaSource.DefaultSubtitleStreamIndex === stream.Index,
+    codec: stream.Codec,
+    isForced: stream.IsForced,
+  } satisfies PlayerSubtitle));
+  return {
+    subtitles,
+    unsupportedLabels: unsupported.map((stream) => formatSubtitleLabel(stream)),
+  };
 }
 
-function LoginPanel({ onLoggedIn }: { onLoggedIn: (profile: ServerProfile) => Promise<void> | void }) {
-  const [form, setForm] = useState(defaultLogin);
-  const [status, setStatus] = useState<LoadState>('idle');
-  const [error, setError] = useState('');
-
-  async function submit(event: React.FormEvent) {
-    event.preventDefault();
-    setStatus('loading');
-    setError('');
-    try {
-      const profile = await loginToEmby(form);
-      await onLoggedIn(profile);
-      setStatus('ready');
-    } catch (err) {
-      setError(getErrorMessage(err));
-      setStatus('error');
-    }
-  }
-
+function AutoConnectGate({ status, error, onRetry }: { status: LoadState; error: string; onRetry: () => void }) {
   return (
-    <div className="login-shell">
-      <section className="login-hero">
+    <div className="login-shell auto-shell">
+      <section className="login-hero compact-hero">
         <div className="orb orb-a" />
         <div className="orb orb-b" />
         <div className="brand-mark"><MonitorPlay size={34} /></div>
         <p className="eyebrow">Aurora Emby Web</p>
-        <h1>可直接部署到 Zeabur 的 Emby 网页版媒体库。</h1>
-        <p className="hero-copy">不走本地代理，直接连接 Emby 官方接口。继续观看、最新入库、下一集、收藏、已看状态、搜索排序这些常用能力都给你留着。</p>
+        <h1>正在连接默认媒体线路。</h1>
+        <p className="hero-copy">默认服务器配置已内置，前端不再显示可编辑入口。连上后直接进媒体库和页面内播放器。</p>
         <div className="hero-metrics">
-          <span>直连 Emby</span>
-          <span>公共账号默认填好</span>
-          <span>mpv 命令一键复制</span>
+          <span>默认配置已隐藏</span>
+          <span>网页内直连播放</span>
+          <span>字幕菜单已接入</span>
         </div>
       </section>
-      <form className="login-card" onSubmit={submit}>
+      <section className="login-card auto-card">
         <div>
-          <p className="eyebrow">连接服务器</p>
-          <h2>登录 Emby</h2>
+          <p className="eyebrow">自动连接</p>
+          <h2>{status === 'loading' ? '正在连接 Emby' : status === 'error' ? '连接失败' : '准备进入媒体库'}</h2>
         </div>
-        <label><span>服务器地址</span><input value={form.url} onChange={(event) => setForm({ ...form, url: event.target.value })} placeholder="https://example.com:443" /></label>
-        <label><span>显示名称</span><input value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} placeholder="我的 Emby" /></label>
-        <label><span>用户名</span><input value={form.username} onChange={(event) => setForm({ ...form, username: event.target.value })} autoComplete="username" /></label>
-        <label><span>密码</span><input value={form.password} onChange={(event) => setForm({ ...form, password: event.target.value })} type="password" autoComplete="current-password" /></label>
-        <p className="field-note">默认公共账号已经填好。若登录成功但后续列表加载失败，通常是 Emby 或反代没放行浏览器跨域。</p>
-        {error && <div className="error-box">{error}</div>}
-        <button className="primary-button" disabled={status === 'loading'}>
-          {status === 'loading' ? <Loader2 className="spin" size={18} /> : <Wifi size={18} />}
-          连接并进入媒体库
-        </button>
-      </form>
+        {status === 'loading' && <div className="connect-state"><Loader2 className="spin" size={22} /><span>正在使用默认线路登录，请稍等。</span></div>}
+        {status === 'error' && <div className="error-box">{error}</div>}
+        <p className="field-note">如果这里反复失败，通常是 Emby 本体、Cloudflare 反代或浏览器跨域限制在搞事。</p>
+        {status === 'error' && <button className="primary-button" onClick={onRetry}><Wifi size={18} />重新连接默认线路</button>}
+      </section>
     </div>
   );
 }
 
 function Sidebar({
-  state,
   activeView,
   views,
   screen,
   onScreen,
   onSelectView,
-  onProfileChange,
 }: {
-  state: AppState;
   activeView?: string;
   views: EmbyItem[];
   screen: Screen;
   onScreen: (screen: Screen) => void;
   onSelectView: (id?: string) => void;
-  onProfileChange: (profileId: string) => void;
 }) {
-  const activeProfile = getActiveProfile(state);
   return (
     <aside className="sidebar">
       <div className="side-brand">
@@ -456,11 +507,9 @@ function Sidebar({
         </button>
       ))}
       <div className="side-spacer" />
-      <div className="profile-switcher">
-        <span>当前服务器</span>
-        <select value={activeProfile?.id || ''} onChange={(event) => onProfileChange(event.target.value)}>
-          {state.profiles.map((profile) => <option key={profile.id} value={profile.id}>{profile.name}</option>)}
-        </select>
+      <div className="server-hint">
+        <span>默认线路已隐藏</span>
+        <strong>直连播放</strong>
       </div>
       <button className={`nav-item ${screen === 'settings' ? 'active' : ''}`} onClick={() => onScreen('settings')}><Settings size={18} />设置</button>
     </aside>
@@ -490,16 +539,112 @@ function Poster({ item, profile, onClick, density }: { item: EmbyItem; profile: 
   );
 }
 
+function PlayerOverlay({
+  profile,
+  session,
+  onClose,
+}: {
+  profile: ServerProfile;
+  session?: PlayerSession;
+  onClose: () => void;
+}) {
+  const playerRef = useRef<MediaPlayerElement | null>(null);
+
+  useEffect(() => {
+    if (!session || !playerRef.current) return;
+    const player = playerRef.current as MediaPlayerElement & { textTracks: { clear: () => void; add: (track: TextTrack) => void } };
+    player.textTracks.clear();
+    session.subtitles.forEach((track) => {
+      player.textTracks.add(new TextTrack({
+        src: track.src,
+        kind: 'subtitles',
+        label: track.label,
+        language: track.language,
+        type: 'vtt',
+        default: track.isDefault,
+      }));
+    });
+  }, [session]);
+
+  if (!session) return null;
+
+  const subtitleMessage = session.subtitles.length > 0
+    ? `已挂载 ${session.subtitles.length} 条文本字幕，播放器右下设置菜单里可直接切换。`
+    : '当前没有可直接挂载的文本字幕。';
+
+  return (
+    <div className="player-backdrop" onMouseDown={onClose}>
+      <section className="player-shell" onMouseDown={(event) => event.stopPropagation()}>
+        <div className="player-head">
+          <div>
+            <p className="eyebrow">页面内播放器</p>
+            <h2>{session.item.Name}</h2>
+          </div>
+          <button className="icon-button close" onClick={onClose}><X size={20} /></button>
+        </div>
+        <div className="player-stage">
+          <MediaPlayer
+            ref={playerRef}
+            key={session.sourceUrl}
+            title={session.item.Name}
+            src={session.sourceUrl}
+            poster={session.posterUrl}
+            streamType="on-demand"
+            viewType="video"
+            crossorigin
+            playsInline
+          >
+            <MediaOutlet />
+            <MediaCommunitySkin translations={playerTranslations} />
+          </MediaPlayer>
+        </div>
+        <div className="player-panels">
+          <div className="panel-card player-note">
+            <h3>字幕状态</h3>
+            <p className="muted">{subtitleMessage}</p>
+            {session.subtitles.length > 0 && (
+              <div className="subtitle-list">
+                {session.subtitles.map((track) => (
+                  <div className="subtitle-pill" key={track.id}>
+                    <span>{track.label}</span>
+                    {track.isDefault ? <strong>默认</strong> : null}
+                  </div>
+                ))}
+              </div>
+            )}
+            {session.unsupportedSubtitleLabels.length > 0 && (
+              <div className="warning-box compact-warning">
+                <AlertTriangle size={16} />
+                <span>以下字幕不是文本轨，浏览器通常不能直接挂载：{session.unsupportedSubtitleLabels.join('、')}。这种情况要靠 Emby 转码或烧录字幕。</span>
+              </div>
+            )}
+          </div>
+          <div className="panel-card player-note">
+            <h3>播放说明</h3>
+            <ul className="tutorial-list compact">
+              <li>播放器右下角“设置”里可以切换字幕、清晰度、倍速。</li>
+              <li>如果字幕菜单为空，说明当前片源没有可直接转换成浏览器文本轨的字幕。</li>
+              <li>如果视频黑屏或无法播放，通常是该媒体编码浏览器不认，或者服务器需要更强的转码支持。</li>
+            </ul>
+            <div className="action-row compact-actions">
+              <a className="secondary-button" href={session.sourceUrl} target="_blank" rel="noreferrer"><SquareArrowOutUpRight size={16} />新标签页打开流</a>
+              <button className="chip-button" onClick={async () => navigator.clipboard.writeText(session.sourceUrl)}><Copy size={16} />复制直链</button>
+            </div>
+          </div>
+        </div>
+      </section>
+    </div>
+  );
+}
+
 function DetailDrawer({
   profile,
   item,
-  mpvPath,
   onClose,
   onChanged,
 }: {
   profile: ServerProfile;
   item?: EmbyItem;
-  mpvPath: string;
   onClose: () => void;
   onChanged: () => void;
 }) {
@@ -507,9 +652,10 @@ function DetailDrawer({
   const [episodes, setEpisodes] = useState<EmbyItem[]>([]);
   const [status, setStatus] = useState<LoadState>('idle');
   const [playStatus, setPlayStatus] = useState('');
-  const [commandPreview, setCommandPreview] = useState('');
   const [imageFailed, setImageFailed] = useState(false);
   const [episodeOrder, setEpisodeOrder] = useState<SortOrder>('Ascending');
+  const [playerSession, setPlayerSession] = useState<PlayerSession | undefined>();
+  const [playerLoading, setPlayerLoading] = useState(false);
   const sortedEpisodes = useMemo(() => [...episodes].sort((a, b) => compareEpisodes(a, b, episodeOrder)), [episodes, episodeOrder]);
 
   useEffect(() => {
@@ -519,9 +665,9 @@ function DetailDrawer({
     setEpisodes([]);
     setStatus('loading');
     setPlayStatus('');
-    setCommandPreview('');
     setImageFailed(false);
     setEpisodeOrder('Ascending');
+    setPlayerSession(undefined);
 
     Promise.all([
       fetchItem(profile, item.Id),
@@ -549,7 +695,6 @@ function DetailDrawer({
       const url = getStreamUrl(profile, target.Id, target.MediaSources?.[0]?.Id);
       await navigator.clipboard.writeText(url);
       setPlayStatus('已复制播放直链。');
-      setCommandPreview(url);
     } catch (err) {
       setPlayStatus(`复制失败：${getErrorMessage(err)}`);
     }
@@ -559,23 +704,29 @@ function DetailDrawer({
     const url = getStreamUrl(profile, target.Id, target.MediaSources?.[0]?.Id);
     window.open(url, '_blank', 'noopener,noreferrer');
     setPlayStatus('已用新标签页打开直链。');
-    setCommandPreview(url);
   }
 
-  async function playWithMpv(target: EmbyItem) {
-    const path = mpvPath.trim();
-    if (!path) {
-      setPlayStatus('还没有填写 mpv.exe 路径。先去设置页保存路径，再回来点播放即可复制完整命令。');
-      setCommandPreview('');
-      return;
-    }
+  async function openPlayer(target: EmbyItem) {
     try {
-      const command = buildMpvCommand(profile, target, path);
-      await navigator.clipboard.writeText(command);
-      setCommandPreview(command);
-      setPlayStatus('已复制 PowerShell 播放命令。把命令粘贴到本机 PowerShell 回车即可用 mpv 播放。');
+      setPlayerLoading(true);
+      setPlayStatus('正在拉取播放信息和字幕轨...');
+      const playback = await fetchPlaybackInfo(profile, target.Id, target.MediaSources?.[0]?.Id);
+      const source = playback.MediaSources?.[0] || ({ Id: target.MediaSources?.[0]?.Id || '', ...target.MediaSources?.[0] } as PlaybackMediaSource);
+      if (!source?.Id) throw new Error('没有拿到可播放的 MediaSourceId');
+      const normalized = normalizeSubtitleTracks(profile, target.Id, source);
+      setPlayerSession({
+        item: target,
+        sourceUrl: getStreamUrl(profile, target.Id, source.Id),
+        posterUrl: getImageUrl(profile, { itemId: target.Id, tag: target.ImageTags?.Primary, width: 1280 }),
+        mediaSource: source,
+        subtitles: normalized.subtitles,
+        unsupportedSubtitleLabels: normalized.unsupportedLabels,
+      });
+      setPlayStatus(normalized.subtitles.length > 0 ? '播放器已准备好，字幕菜单也一起接进去了。' : '播放器已准备好，但当前片源没有可直接挂载的文本字幕。');
     } catch (err) {
       setPlayStatus(getErrorMessage(err));
+    } finally {
+      setPlayerLoading(false);
     }
   }
 
@@ -608,77 +759,82 @@ function DetailDrawer({
   }
 
   return (
-    <div className="drawer-backdrop" onMouseDown={onClose}>
-      <aside className="detail-drawer" onMouseDown={(event) => event.stopPropagation()}>
-        <button className="icon-button close" onClick={onClose}><X size={20} /></button>
-        <div className="detail-top">
-          <div className="detail-poster">
-            {!imageFailed ? <img src={imageUrl} alt={detail.Name} onError={() => setImageFailed(true)} /> : <Film size={48} />}
-          </div>
-          <div className="detail-copy">
-            <span className="type-pill inline">{detail.Type}</span>
-            <h2>{detail.Name}</h2>
-            <p>{detail.Overview || '暂无简介。'}</p>
-            <div className="meta-row">
-              <span>{detail.ProductionYear || '未知年份'}</span>
-              <span>{ticksToTime(detail.RunTimeTicks)}</span>
-              {detail.CommunityRating ? <span>{detail.CommunityRating.toFixed(1)} 分</span> : null}
-              {detail.UserData?.Played ? <span>已看完</span> : null}
+    <>
+      <div className="drawer-backdrop" onMouseDown={onClose}>
+        <aside className="detail-drawer" onMouseDown={(event) => event.stopPropagation()}>
+          <button className="icon-button close" onClick={onClose}><X size={20} /></button>
+          <div className="detail-top">
+            <div className="detail-poster">
+              {!imageFailed ? <img src={imageUrl} alt={detail.Name} onError={() => setImageFailed(true)} /> : <Film size={48} />}
             </div>
-            <div className="action-row secondary-actions">
-              <button className="chip-button" onClick={toggleFavorite}><Star size={16} />{detail.UserData?.IsFavorite ? '取消收藏' : '收藏'}</button>
-              <button className="chip-button" onClick={togglePlayed}><Check size={16} />{detail.UserData?.Played ? '标为未看' : '标为已看'}</button>
-            </div>
-            {playable && (
-              <div className="action-grid">
-                <button className="primary-button wide" onClick={() => playWithMpv(detail)}><Play size={18} />复制 mpv 播放命令</button>
-                <button className="secondary-button" onClick={() => copyLink(detail)}><Copy size={18} />复制直链</button>
-                <button className="secondary-button" onClick={() => openStream(detail)}><SquareArrowOutUpRight size={18} />浏览器打开</button>
+            <div className="detail-copy">
+              <span className="type-pill inline">{detail.Type}</span>
+              <h2>{detail.Name}</h2>
+              <p>{detail.Overview || '暂无简介。'}</p>
+              <div className="meta-row">
+                <span>{detail.ProductionYear || '未知年份'}</span>
+                <span>{ticksToTime(detail.RunTimeTicks)}</span>
+                {detail.CommunityRating ? <span>{detail.CommunityRating.toFixed(1)} 分</span> : null}
+                {detail.UserData?.Played ? <span>已看完</span> : null}
               </div>
-            )}
-            {playStatus && <div className="hint-box">{playStatus}</div>}
-            {commandPreview && <pre className="command-box">{commandPreview}</pre>}
-          </div>
-        </div>
-        {detail.MediaSources?.length ? (
-          <div className="source-panel">
-            <h3>媒体源</h3>
-            {detail.MediaSources.map((source) => (
-              <div className="source-row" key={source.Id}>
-                <span>{source.Name || source.Container || '默认源'}</span>
-                <small>{bitrateToText(source.Bitrate)} · {bytesToSize(source.Size)} · {source.Protocol || 'File'}</small>
+              <div className="action-row secondary-actions">
+                <button className="chip-button" onClick={toggleFavorite}><Star size={16} />{detail.UserData?.IsFavorite ? '取消收藏' : '收藏'}</button>
+                <button className="chip-button" onClick={togglePlayed}><Check size={16} />{detail.UserData?.Played ? '标为未看' : '标为已看'}</button>
               </div>
-            ))}
-          </div>
-        ) : null}
-        {detail.Type === 'Series' && (
-          <div className="episode-panel">
-            <div className="episode-heading">
-              <h3>剧集列表 {status === 'loading' && <Loader2 className="spin" size={16} />}</h3>
-              <button className="chip-button" onClick={() => setEpisodeOrder((current) => current === 'Ascending' ? 'Descending' : 'Ascending')}>
-                {episodeOrder === 'Ascending' ? <ArrowDownAZ size={16} /> : <ArrowUpAZ size={16} />}
-                {episodeOrder === 'Ascending' ? '正序' : '倒序'}
-              </button>
-            </div>
-            {sortedEpisodes.map((episode) => (
-              <div className="episode-card" key={episode.Id}>
-                <button className="episode-row" onClick={() => playWithMpv(episode)}>
-                  <span>S{episode.ParentIndexNumber || 1}E{episode.IndexNumber || 0}</span>
-                  <strong>{episode.Name}</strong>
-                  <small>{ticksToTime(episode.RunTimeTicks)}</small>
-                  <Play size={16} />
-                </button>
-                <div className="episode-actions">
-                  <button className="mini-button" onClick={() => copyLink(episode)}><Copy size={14} />直链</button>
-                  <button className="mini-button" onClick={() => openStream(episode)}><ExternalLink size={14} />打开</button>
+              {playable && (
+                <div className="action-grid">
+                  <button className="primary-button wide" onClick={() => openPlayer(detail)} disabled={playerLoading}>
+                    {playerLoading ? <Loader2 className="spin" size={18} /> : <Play size={18} />}
+                    进入页面内播放器
+                  </button>
+                  <button className="secondary-button" onClick={() => copyLink(detail)}><Copy size={18} />复制直链</button>
+                  <button className="secondary-button" onClick={() => openStream(detail)}><SquareArrowOutUpRight size={18} />浏览器打开</button>
                 </div>
-              </div>
-            ))}
-            {status === 'ready' && episodes.length === 0 && <div className="empty-line">没有读取到剧集。</div>}
+              )}
+              {playStatus && <div className="hint-box">{playStatus}</div>}
+            </div>
           </div>
-        )}
-      </aside>
-    </div>
+          {detail.MediaSources?.length ? (
+            <div className="source-panel">
+              <h3>媒体源</h3>
+              {detail.MediaSources.map((source) => (
+                <div className="source-row" key={source.Id}>
+                  <span>{source.Name || source.Container || '默认源'}</span>
+                  <small>{bitrateToText(source.Bitrate)} · {bytesToSize(source.Size)} · {source.Protocol || 'File'}</small>
+                </div>
+              ))}
+            </div>
+          ) : null}
+          {detail.Type === 'Series' && (
+            <div className="episode-panel">
+              <div className="episode-heading">
+                <h3>剧集列表 {status === 'loading' && <Loader2 className="spin" size={16} />}</h3>
+                <button className="chip-button" onClick={() => setEpisodeOrder((current) => current === 'Ascending' ? 'Descending' : 'Ascending')}>
+                  {episodeOrder === 'Ascending' ? <ArrowDownAZ size={16} /> : <ArrowUpAZ size={16} />}
+                  {episodeOrder === 'Ascending' ? '正序' : '倒序'}
+                </button>
+              </div>
+              {sortedEpisodes.map((episode) => (
+                <div className="episode-card" key={episode.Id}>
+                  <button className="episode-row" onClick={() => openPlayer(episode)}>
+                    <span>S{episode.ParentIndexNumber || 1}E{episode.IndexNumber || 0}</span>
+                    <strong>{episode.Name}</strong>
+                    <small>{ticksToTime(episode.RunTimeTicks)}</small>
+                    <Play size={16} />
+                  </button>
+                  <div className="episode-actions">
+                    <button className="mini-button" onClick={() => copyLink(episode)}><Copy size={14} />直链</button>
+                    <button className="mini-button" onClick={() => openStream(episode)}><SquareArrowOutUpRight size={14} />打开</button>
+                  </div>
+                </div>
+              ))}
+              {status === 'ready' && episodes.length === 0 && <div className="empty-line">没有读取到剧集。</div>}
+            </div>
+          )}
+        </aside>
+      </div>
+      <PlayerOverlay profile={profile} session={playerSession} onClose={() => setPlayerSession(undefined)} />
+    </>
   );
 }
 
@@ -757,7 +913,7 @@ function Home({ activeView, state, profile }: { activeView?: string; state: AppS
       <section className="status-strip">
         <div><strong>{visibleItems.length}/{total}</strong><span>当前显示 / 总媒体</span></div>
         <div><strong>{mode === 'library' ? activeSort.label : homeModes.find((item) => item.value === mode)?.label}</strong><span>{mode === 'library' ? (sortOrder === 'Descending' ? '倒序' : '正序') : '官方接口'}</span></div>
-        <div><strong>{state.mpvPath.trim() ? 'Ready' : '待填写'}</strong><span>{state.mpvPath.trim() ? '已保存 mpv.exe 路径' : '去设置页填写 mpv.exe 路径'}</span></div>
+        <div><strong>直连播放</strong><span>Vidstack 页面内播放器 + 字幕菜单</span></div>
       </section>
       <section className="toolbar-panel">
         <div className="control-group">
@@ -774,8 +930,7 @@ function Home({ activeView, state, profile }: { activeView?: string; state: AppS
           <label>
             <span>筛选</span>
             <select value={filter} onChange={(event) => setFilter(event.target.value as FilterOption)}>
-              {filterOptions.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
-            </select>
+              {filterOptions.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select>
           </label>
         </div>
         <div className="control-actions">
@@ -786,7 +941,7 @@ function Home({ activeView, state, profile }: { activeView?: string; state: AppS
           </button>
         </div>
       </section>
-      {!state.mpvPath.trim() && <div className="warning-box"><AlertTriangle size={18} /><span>网页不能直接启动本地 exe。先到设置页填好 mpv.exe 路径，之后点“复制 mpv 播放命令”即可本机播放。</span></div>}
+      <div className="success-box"><Check size={18} /><span>播放器已改为页面内直连播放。点开详情后直接进 Vidstack，字幕切换在播放器设置菜单里。</span></div>
       {status === 'loading' && <div className={`grid ${density === 'compact' ? 'grid-compact' : ''} skeleton-grid`}>{Array.from({ length: 12 }).map((_, index) => <div className="skeleton-card" key={index} />)}</div>}
       {status === 'error' && <div className="error-state"><h3>加载失败</h3><p>{error}</p></div>}
       {status === 'ready' && visibleItems.length === 0 && <div className="empty-state"><Tv size={42} /><h3>没有找到媒体</h3><p>换个入口或关键词试试，比如继续观看、最新入库、下一集。</p></div>}
@@ -800,127 +955,68 @@ function Home({ activeView, state, profile }: { activeView?: string; state: AppS
               </div>
             </section>
           ))}
-          {visibleItems.length < total && mode !== 'nextup' && <button className="load-more" onClick={() => setLimit((value) => value + 100)}><CalendarClock size={18} />加载更多</button>}
+          {visibleItems.length < total && mode !== 'nextup' && <button className="load-more" onClick={() => setLimit((value) => value + 100)}><RefreshCw size={18} />加载更多</button>}
         </div>
       )}
-      <DetailDrawer profile={profile} item={selected} mpvPath={state.mpvPath} onClose={() => setSelected(undefined)} onChanged={() => setRefreshSeed((value) => value + 1)} />
+      <DetailDrawer profile={profile} item={selected} onClose={() => setSelected(undefined)} onChanged={() => setRefreshSeed((value) => value + 1)} />
     </main>
   );
 }
 
-function SettingsPage({ state, onState }: { state: AppState; onState: (patch: Partial<AppState>) => void }) {
-  const [login, setLogin] = useState(defaultLogin);
-  const [mpvPath, setMpvPath] = useState(state.mpvPath || '');
+function SettingsPage({ profile, onReconnect }: { profile?: ServerProfile; onReconnect: () => void }) {
   const [message, setMessage] = useState('');
-  const [sampleCommand, setSampleCommand] = useState('');
-  const activeProfile = getActiveProfile(state);
 
-  useEffect(() => setMpvPath(state.mpvPath || ''), [state.mpvPath]);
-
-  useEffect(() => {
-    if (!activeProfile || !mpvPath.trim()) {
-      setSampleCommand('');
-      return;
-    }
-    const demoItem: EmbyItem = { Id: 'demo', Name: '示例视频', Type: 'Video', MediaSources: [{ Id: 'default' }] };
-    const streamUrl = `${activeProfile.url}/Videos/示例ID/stream?static=true&api_key=${activeProfile.accessToken}`;
-    const command = buildMpvCommand(activeProfile, { ...demoItem, Id: '示例ID' }, mpvPath).replace(/示例ID/g, '真实媒体ID').replace(getStreamUrl(activeProfile, '真实媒体ID', 'default'), streamUrl);
-    setSampleCommand(command);
-  }, [activeProfile, mpvPath]);
-
-  async function addServer(event: React.FormEvent) {
-    event.preventDefault();
-    try {
-      const profile = await loginToEmby(login);
-      const profiles = [profile, ...state.profiles.filter((item) => item.id !== profile.id)];
-      onState({ profiles, activeProfileId: profile.id });
-      setMessage('服务器已添加并切换。');
-    } catch (err) {
-      setMessage(getErrorMessage(err));
-    }
-  }
-
-  function remove(profile: ServerProfile) {
-    const profiles = state.profiles.filter((item) => item.id !== profile.id);
-    onState({ profiles, activeProfileId: profiles[0]?.id });
-    setMessage('服务器已移除。');
-  }
-
-  function saveMpvPath() {
-    onState({ mpvPath: mpvPath.trim() });
-    setMessage(mpvPath.trim() ? 'mpv 路径已保存。之后在详情里点“复制 mpv 播放命令”即可。' : '已清空 mpv 路径。');
-  }
-
-  async function copySample() {
-    if (!sampleCommand) return;
-    await navigator.clipboard.writeText(sampleCommand);
-    setMessage('已复制示例命令。');
+  function clearLocalSession() {
+    window.localStorage.removeItem(STORAGE_KEY);
+    setMessage('本地缓存已清空。重新连接后会自动写回新的登录态。');
   }
 
   return (
     <main className="content settings-content">
-      <header className="topbar"><div><p className="eyebrow">播放器设置</p><h1>服务器与 mpv</h1></div></header>
+      <header className="topbar"><div><p className="eyebrow">播放器设置</p><h1>默认线路与字幕策略</h1></div></header>
       <section className="settings-grid">
-        <form className="panel-card" onSubmit={addServer}>
-          <h2>添加 Emby 服务器</h2>
-          <label><span>服务器地址</span><input value={login.url} onChange={(event) => setLogin({ ...login, url: event.target.value })} /></label>
-          <label><span>名称</span><input value={login.name} onChange={(event) => setLogin({ ...login, name: event.target.value })} /></label>
-          <label><span>用户名</span><input value={login.username} onChange={(event) => setLogin({ ...login, username: event.target.value })} /></label>
-          <label><span>密码</span><input value={login.password} type="password" onChange={(event) => setLogin({ ...login, password: event.target.value })} /></label>
-          <button className="primary-button"><Server size={18} />保存服务器</button>
-          <p className="field-note">这是纯网页版本，不走桌面代理。能否正常浏览内容，取决于 Emby 服务器是否允许浏览器直接跨域访问。</p>
-        </form>
+        <section className="panel-card">
+          <h2>默认线路</h2>
+          <p className="muted">默认 Emby 地址、用户名、密码已经内置，但前端 UI 不再展示这些配置项。这里仅保留连接状态，不暴露服务器具体信息。</p>
+          <div className="server-row masked-row">
+            <div>
+              <strong>{profile?.name || '默认 Emby 线路'}</strong>
+              <span>{profile ? `最近登录：${new Date(profile.lastLoginAt).toLocaleString()}` : '尚未建立连接'}</span>
+            </div>
+            <button className="secondary-button" onClick={onReconnect}><Wifi size={16} />重新连接</button>
+          </div>
+        </section>
 
         <section className="panel-card">
-          <h2>mpv 本机播放</h2>
-          <p className="muted">浏览器不能直接替你启动本地 exe，这是浏览器安全限制，不是我偷懒。这里改成更稳的方案：你填一次 mpv.exe 路径，之后点播放就自动复制完整 PowerShell 命令。</p>
-          <label><span>mpv.exe 路径</span><input value={mpvPath} onChange={(event) => setMpvPath(event.target.value)} placeholder="C:\\Tools\\mpv\\mpv.exe" /></label>
-          <div className="action-row compact-actions">
-            <button className="secondary-button" type="button" onClick={saveMpvPath}>保存路径</button>
-            <a className="download-link" href="/downloads/mpv-x86_64-20260610-git-304426c.7z" download><Download size={16} />下载 mpv 压缩包</a>
-          </div>
-          {sampleCommand && <pre className="command-box small">{sampleCommand}</pre>}
-          {sampleCommand && <button className="chip-button" type="button" onClick={copySample}><Copy size={16} />复制示例命令</button>}
+          <h2>字幕说明</h2>
+          <ul className="tutorial-list compact">
+            <li>播放器已经接入字幕菜单，文本字幕会自动转换成 VTT 轨道加载。</li>
+            <li>如果 Emby 返回的是 PGS、图形字幕或某些复杂内封 ASS，浏览器通常无法直接作为文本轨展示。</li>
+            <li>这类字幕需要服务端转码、转字幕格式，或者直接烧录到视频流里。</li>
+          </ul>
         </section>
       </section>
 
       <section className="tutorial-grid">
         <section className="panel-card">
-          <h2>使用教程</h2>
+          <h2>当前版本怎么用</h2>
           <ol className="tutorial-list">
-            <li>下载右侧提供的 mpv 压缩包，解压到任意目录，比如 <code>C:\\Tools\\mpv</code>。</li>
-            <li>把 <code>mpv.exe</code> 的完整路径填到上面的输入框，例如 <code>C:\\Tools\\mpv\\mpv.exe</code>。</li>
-            <li>回到媒体库，点任意影片详情里的“复制 mpv 播放命令”。</li>
-            <li>在你的 Windows PowerShell 粘贴并回车，mpv 就会直接播放该视频。</li>
-            <li>如果你只想拿播放地址，不想用 mpv，也可以点“复制直链”或“浏览器打开”。</li>
+            <li>页面会自动连默认线路，不再显示登录表单。</li>
+            <li>进入影片详情后点“进入页面内播放器”。</li>
+            <li>播放界面右下角打开“设置”，可切换字幕、倍速、清晰度。</li>
+            <li>若字幕菜单为空，优先检查片源是否存在文本字幕轨。</li>
           </ol>
         </section>
 
         <section className="panel-card">
-          <h2>已保存服务器</h2>
-          {state.profiles.length === 0 && <div className="empty-line">还没有保存服务器。</div>}
-          {state.profiles.map((profile) => (
-            <div className="server-row" key={profile.id}>
-              <div>
-                <strong>{profile.name}</strong>
-                <span>{profile.url} · {profile.username}</span>
-              </div>
-              <button className="danger-button" onClick={() => remove(profile)}><Trash2 size={16} />移除</button>
-            </div>
-          ))}
+          <h2>维护操作</h2>
+          <div className="action-row compact-actions">
+            <button className="chip-button" onClick={clearLocalSession}><RefreshCw size={16} />清空本地缓存</button>
+            <button className="chip-button" onClick={() => setMessage('如需真正隐藏服务器地址与账号，只能改成后端中转，纯静态前端做不到完全保密。')}><AlertTriangle size={16} />查看安全提醒</button>
+          </div>
+          {message && <div className="hint-box">{message}</div>}
         </section>
       </section>
-
-      <section className="panel-card note-panel">
-        <h2>部署提醒</h2>
-        <ul className="tutorial-list compact">
-          <li>Zeabur 直接导入这个项目即可，构建命令用 <code>npm run build</code>，输出目录是 <code>dist</code>。</li>
-          <li>启动命令可以用 <code>npm run start</code>。这个版本本质上是静态前端，用 preview 服务承载即可。</li>
-          <li>如果登录成功、但海报或媒体列表加载失败，优先检查 Emby 或 Cloudflare 反代的 CORS 配置。</li>
-        </ul>
-      </section>
-
-      {message && <div className="floating-message hint-box">{message}</div>}
     </main>
   );
 }
@@ -932,6 +1028,8 @@ export function App() {
   const [activeView, setActiveView] = useState<string | undefined>();
   const [screen, setScreen] = useState<Screen>('home');
   const [viewError, setViewError] = useState('');
+  const [autoConnectStatus, setAutoConnectStatus] = useState<LoadState>('idle');
+  const [autoConnectError, setAutoConnectError] = useState('');
 
   useTheme(state.theme);
   const hasProfile = state.profiles.length > 0;
@@ -952,6 +1050,28 @@ export function App() {
     writeStoredState(state);
   }, [state, booting]);
 
+  async function connectDefaultProfile() {
+    try {
+      setAutoConnectStatus('loading');
+      setAutoConnectError('');
+      const profile = await loginToEmby(defaultLogin);
+      setState((current) => ({
+        ...current,
+        profiles: [profile],
+        activeProfileId: profile.id,
+      }));
+      setAutoConnectStatus('ready');
+    } catch (err) {
+      setAutoConnectStatus('error');
+      setAutoConnectError(getErrorMessage(err));
+    }
+  }
+
+  useEffect(() => {
+    if (booting || hasProfile || autoConnectStatus === 'loading') return;
+    void connectDefaultProfile();
+  }, [booting, hasProfile, autoConnectStatus]);
+
   useEffect(() => {
     if (!hasProfile || !activeProfile) return;
     fetchViews(activeProfile).then((response) => {
@@ -963,24 +1083,12 @@ export function App() {
     });
   }, [hasProfile, activeProfile]);
 
-  async function handleLoggedIn(profile: ServerProfile) {
-    const profiles = [profile, ...state.profiles.filter((item) => item.id !== profile.id)];
-    setState((current) => ({ ...current, profiles, activeProfileId: profile.id }));
-  }
-
-  function handleProfileChange(profileId: string) {
-    patchState({ activeProfileId: profileId });
-    setActiveView(undefined);
-    setScreen('home');
-  }
-
   if (booting) return <div className="boot-screen"><Loader2 className="spin" size={28} />正在启动网页播放器...</div>;
-  if (!hasProfile) return <LoginPanel onLoggedIn={handleLoggedIn} />;
-  if (!activeProfile) return <LoginPanel onLoggedIn={handleLoggedIn} />;
+  if (!hasProfile || !activeProfile) return <AutoConnectGate status={autoConnectStatus} error={autoConnectError} onRetry={() => void connectDefaultProfile()} />;
 
   return (
     <div className="app-shell">
-      <Sidebar state={state} views={views} activeView={activeView} screen={screen} onScreen={setScreen} onSelectView={setActiveView} onProfileChange={handleProfileChange} />
+      <Sidebar views={views} activeView={activeView} screen={screen} onScreen={setScreen} onSelectView={setActiveView} />
       <div className="title-safe-zone" />
       <div className="theme-toggle" role="group" aria-label="主题切换">
         {(['light', 'dark', 'system'] as const).map((theme) => (
@@ -992,7 +1100,7 @@ export function App() {
       <div className="mobile-warning">{viewError && <div className="warning-box inline-warning"><AlertTriangle size={16} /><span>{viewError}</span></div>}</div>
       {screen === 'home'
         ? <Home activeView={activeView} state={state} profile={activeProfile} />
-        : <SettingsPage state={state} onState={patchState} />}
+        : <SettingsPage profile={activeProfile} onReconnect={() => void connectDefaultProfile()} />}
     </div>
   );
 }

@@ -21,7 +21,6 @@ export interface AppState {
   profiles: ServerProfile[];
   activeProfileId?: string;
   theme: ThemeMode;
-  mpvPath: string;
 }
 
 export interface EmbyImageTags {
@@ -47,6 +46,34 @@ export interface EmbyUserData {
   IsFavorite?: boolean;
   PlaybackPositionTicks?: number;
   PlayCount?: number;
+}
+
+export interface EmbyMediaStream {
+  Index: number;
+  Type?: string;
+  Codec?: string;
+  Language?: string;
+  DisplayTitle?: string;
+  Title?: string;
+  IsExternal?: boolean;
+  IsTextSubtitleStream?: boolean;
+  IsDefault?: boolean;
+  IsForced?: boolean;
+  DeliveryMethod?: string;
+  DeliveryUrl?: string;
+}
+
+export interface PlaybackMediaSource extends MediaSource {
+  DefaultSubtitleStreamIndex?: number;
+  SupportsDirectPlay?: boolean;
+  SupportsDirectStream?: boolean;
+  SupportsTranscoding?: boolean;
+  MediaStreams?: EmbyMediaStream[];
+}
+
+export interface PlaybackInfoResponse {
+  MediaSources?: PlaybackMediaSource[];
+  PlaySessionId?: string;
 }
 
 export interface EmbyItem {
