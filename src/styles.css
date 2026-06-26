@@ -379,6 +379,8 @@ input:focus, select:focus, textarea:focus { border-color: var(--accent); box-sha
 .subtitle-list { display: flex; flex-wrap: wrap; gap: 10px; }
 .subtitle-pill { display: inline-flex; align-items: center; gap: 8px; padding: 10px 12px; border-radius: 999px; border: 1px solid var(--line); background: rgba(125,125,125,0.08); font-size: 12px; }
 .subtitle-pill strong { color: var(--accent); font-size: 12px; }
+.source-order { display: flex; gap: 8px; flex-wrap: wrap; color: var(--muted); font-size: 12px; }
+.source-order strong { color: var(--text); font-weight: 700; }
 
 .detail-top { display: grid; grid-template-columns: 220px 1fr; gap: 26px; padding-top: 28px; }
 .detail-poster { aspect-ratio: 2/3; border-radius: 26px; background: rgba(125,125,125,0.12); display: grid; place-items: center; overflow: hidden; border: 1px solid var(--line); }

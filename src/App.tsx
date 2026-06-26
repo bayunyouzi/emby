@@ -60,6 +60,12 @@ type PlayerSubtitle = {
   codec?: string;
   isForced?: boolean;
 };
+type PlayerSource = {
+  src: string;
+  type: string;
+  label: 'hls' | 'direct';
+};
+
 type PlayerSession = {
   item: EmbyItem;
   sourceUrl: string;
@@ -69,6 +75,7 @@ type PlayerSession = {
   unsupportedSubtitleLabels: string[];
   streamFlavor: 'direct' | 'hls';
   fallbackReason?: 'none' | 'subtitle_unsupported' | 'no_subtitle';
+  sourceChain: PlayerSource[];
 };
 
 const STORAGE_KEY = 'aurora-emby-web-state';
@@ -251,10 +258,18 @@ function getHlsStreamUrl(profile: ServerProfile, itemId: string, mediaSourceId: 
   return url.toString();
 }
 
-function getHlsFallbackUrls(profile: ServerProfile, itemId: string, mediaSourceId: string, subtitleStreamIndex?: number) {
+function getPlayerSourceChain(profile: ServerProfile, itemId: string, mediaSourceId: string, subtitleStreamIndex?: number): PlayerSource[] {
   return [
-    getHlsStreamUrl(profile, itemId, mediaSourceId, subtitleStreamIndex),
-    getStreamUrl(profile, itemId, mediaSourceId),
+    {
+      src: getStreamUrl(profile, itemId, mediaSourceId),
+      type: 'video/mp4',
+      label: 'direct',
+    },
+    {
+      src: getHlsStreamUrl(profile, itemId, mediaSourceId, subtitleStreamIndex),
+      type: 'application/x-mpegURL',
+      label: 'hls',
+    },
   ];
 }
 
@@ -614,28 +629,28 @@ function PlayerOverlay({
 
   useEffect(() => {
     if (!session) return;
-    const fallbackUrls = getHlsFallbackUrls(profile, session.item.Id, session.mediaSource.Id, session.mediaSource.DefaultSubtitleStreamIndex);
     setFallbackStep(0);
-    setCurrentSrc(fallbackUrls[0]);
-    setPlayerHint(session.streamFlavor === 'hls' ? '先尝试 HLS 转码流。' : '先尝试当前播放流。');
+    setCurrentSrc(session.sourceChain[0]?.src || session.sourceUrl);
+    setPlayerHint(session.sourceChain[0]?.label === 'direct' ? '先尝试直链流。' : '先尝试 HLS 转码流。');
   }, [profile, session]);
 
   if (!session) return null;
 
-  const fallbackUrls = getHlsFallbackUrls(profile, session.item.Id, session.mediaSource.Id, session.mediaSource.DefaultSubtitleStreamIndex);
+  const sourceChain = session.sourceChain;
   const subtitleMessage = session.subtitles.length > 0
     ? `已挂载 ${session.subtitles.length} 条文本字幕，播放器右下设置菜单里可直接切换。`
     : '当前没有可直接挂载的文本字幕，但播放器仍会先尝试网页内播放。';
 
   function handlePlayerError() {
-    if (fallbackStep + 1 < fallbackUrls.length) {
+    if (fallbackStep + 1 < sourceChain.length) {
       const nextStep = fallbackStep + 1;
+      const nextSource = sourceChain[nextStep];
       setFallbackStep(nextStep);
-      setCurrentSrc(fallbackUrls[nextStep]);
-      setPlayerHint(nextStep === 1 ? 'HLS 失败，已自动切到直链流再试一次。' : '播放器已切换到备用播放流。');
+      setCurrentSrc(nextSource.src);
+      setPlayerHint(nextSource.label === 'hls' ? '直链流失败，已自动切到 HLS 转码流再试一次。' : 'HLS 失败，已自动切到直链流再试一次。');
       return;
     }
-    setPlayerHint('网页内播放还是失败了。建议改用下方的 mpv 命令手动播放。');
+    setPlayerHint('网页内播放还是失败了。说明不是按钮问题，而是当前片源/转码链路浏览器真吃不下，建议改用下方的 mpv 命令手动播放。');
   }
 
   return (
@@ -670,6 +685,10 @@ function PlayerOverlay({
             <h3>字幕状态</h3>
             <p className="muted">{subtitleMessage}</p>
             {playerHint ? <div className="hint-box">{playerHint}</div> : null}
+            <div className="source-order">
+              <span>当前尝试顺序：</span>
+              <strong>{sourceChain.map((item) => item.label === 'direct' ? '直链' : 'HLS').join(' → ')}</strong>
+            </div>
             {session.subtitles.length > 0 && (
               <div className="subtitle-list">
                 {session.subtitles.map((track) => (
@@ -785,7 +804,7 @@ function DetailDrawer({
       const source = playback.MediaSources?.[0] || ({ Id: target.MediaSources?.[0]?.Id || '', ...target.MediaSources?.[0] } as PlaybackMediaSource);
       if (!source?.Id) throw new Error('没有拿到可播放的 MediaSourceId');
       const normalized = normalizeSubtitleTracks(profile, target.Id, source);
-      const hlsUrls = getHlsFallbackUrls(profile, target.Id, source.Id, source.DefaultSubtitleStreamIndex);
+      const sourceChain = getPlayerSourceChain(profile, target.Id, source.Id, source.DefaultSubtitleStreamIndex);
       const fallbackReason = normalized.hasAnySubtitle
         ? (normalized.subtitles.length > 0 ? 'none' : 'subtitle_unsupported')
         : 'no_subtitle';
@@ -793,21 +812,22 @@ function DetailDrawer({
       setPlaybackMode('browser');
       setPlayerSession({
         item: target,
-        sourceUrl: hlsUrls[0],
+        sourceUrl: sourceChain[0].src,
         posterUrl: getImageUrl(profile, { itemId: target.Id, tag: target.ImageTags?.Primary, width: 1280 }),
         mediaSource: source,
         subtitles: normalized.subtitles,
         unsupportedSubtitleLabels: normalized.unsupportedLabels,
-        streamFlavor: 'hls',
+        streamFlavor: 'direct',
         fallbackReason,
+        sourceChain,
       });
 
       if (normalized.subtitles.length > 0) {
-        setPlayStatus('检测到文本字幕，优先进入浏览器播放器并接入字幕菜单。');
+        setPlayStatus('检测到文本字幕，先尝试浏览器最容易直接吃下的直链流；如果失败，再自动切到 HLS。');
       } else if (normalized.hasAnySubtitle) {
-        setPlayStatus('当前字幕不是浏览器可用文本轨，但仍会先尝试网页内播放；如果不稳，你再手动选 mpv。');
+        setPlayStatus('当前字幕不是浏览器可用文本轨，但仍先尝试网页内播放；如果直链不稳，再自动切 HLS。');
       } else {
-        setPlayStatus('当前片源没有字幕，先直接尝试网页内播放；如果不稳，你再自己选 mpv。');
+        setPlayStatus('当前片源没有字幕，先直接尝试网页内播放；如果直链不稳，再自动切 HLS，你也可以自己选 mpv。');
       }
     } catch (err) {
       setPlayStatus(getErrorMessage(err));
